@@ -1,0 +1,108 @@
+name: App probe
+# SCRATCH PROOF ONLY. Manually dispatched on main (so the main-only environment applies) to drive
+# the ruleset experiments as the scratch App. Never prints the key, a JWT or a token.
+on:
+  workflow_dispatch:
+    inputs:
+      op: { description: "verify|create|update|mintbad|badsha|uninstall", required: true }
+      sha: { description: "head SHA", required: false, default: "" }
+      status: { description: "queued|in_progress|completed", required: false, default: "completed" }
+      conclusion: { description: "success|failure|neutral|skipped|cancelled|timed_out|action_required", required: false, default: "" }
+      check_id: { description: "check run id (update)", required: false, default: "" }
+      external_id: { description: "external id", required: false, default: "" }
+permissions:
+  contents: read
+jobs:
+  probe:
+    name: App probe
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment:
+      name: gate-identity
+      deployment: false
+    steps:
+      - name: Probe
+        env:
+          APP_ID: ${{ vars.APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+          OP: ${{ inputs.op }}
+          SHA: ${{ inputs.sha }}
+          STATUS: ${{ inputs.status }}
+          CONCLUSION: ${{ inputs.conclusion }}
+          CHECK_ID: ${{ inputs.check_id }}
+          EXTERNAL_ID: ${{ inputs.external_id }}
+        shell: node {0}
+        run: |
+          "use strict";
+          process.exitCode = 1;
+          const fs = require("fs");
+          const crypto = require("crypto");
+          const API = "https://api.github.com";
+          const repo = process.env.GITHUB_REPOSITORY;
+          const NAME = "Gate-file guard";
+          const APP_ID = process.env.APP_ID;
+          const log = (...a) => console.log(...a);
+          const b64 = o => Buffer.from(typeof o === "string" ? o : JSON.stringify(o)).toString("base64url");
+          // Never logs the key, a JWT or a token: errors carry only method, path, status and GitHub's message.
+          async function gh(path, token, init = {}) {
+            const res = await fetch(API + path, { ...init, headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "Content-Type": "application/json" } });
+            const text = await res.text();
+            if (!res.ok) { const e = new Error(`${init.method || "GET"} ${path.split("?")[0]}: HTTP ${res.status} ${text.slice(0, 160)}`); e.status = res.status; throw e; }
+            return text ? JSON.parse(text) : {};
+          }
+          function jwt() {
+            const now = Math.floor(Date.now() / 1000);
+            const unsigned = `${b64({ alg: "RS256", typ: "JWT" })}.${b64({ iat: now - 60, exp: now + 540, iss: APP_ID })}`;
+            return `${unsigned}.${crypto.createSign("RSA-SHA256").update(unsigned).sign(process.env.APP_PRIVATE_KEY, "base64url")}`;
+          }
+          async function appToken(permissions = { checks: "write" }) {
+            const j = jwt();
+            const inst = await gh(`/repos/${repo}/installation`, j);
+            const t = await gh(`/app/installations/${inst.id}/access_tokens`, j, { method: "POST", body: JSON.stringify({ repositories: [repo.split("/")[1]], permissions }) });
+            return { token: t.token, installation: inst.id, perms: t.permissions };
+          }
+          const sleep = ms => new Promise(r => setTimeout(r, ms));
+          const show = c => `check ${c.id} name=${JSON.stringify(c.name)} app=${c.app && c.app.id}/${c.app && c.app.slug} suite=${c.check_suite && c.check_suite.id} head=${c.head_sha} status=${c.status} conclusion=${c.conclusion} external_id=${c.external_id}`;
+          (async () => {
+            const e = process.env;
+            log(`op=${e.OP} ref=${e.GITHUB_REF} key present: ${e.APP_PRIVATE_KEY ? "YES" : "NO"} APP_ID=${APP_ID}`);
+            if (e.OP === "verify") {
+              const j = jwt();
+              const app = await gh("/app", j);
+              log(`APP: id=${app.id} slug=${app.slug} owner=${app.owner && app.owner.login} permissions=${JSON.stringify(app.permissions)} events=${JSON.stringify(app.events)}`);
+              const installs = await gh("/app/installations", j);
+              for (const i of installs) log(`INSTALLATION: id=${i.id} account=${i.account && i.account.login} selection=${i.repository_selection} permissions=${JSON.stringify(i.permissions)} suspended=${!!i.suspended_at}`);
+              const { token, perms } = await appToken({ checks: "write" });
+              log(`TRUSTED TOKEN MINT: PASS (permissions ${JSON.stringify(perms)})`);
+              const t2 = await gh(`/app/installations/${installs[0].id}/access_tokens`, j, { method: "POST", body: "{}" });
+              const repos = await gh("/installation/repositories", t2.token);
+              log(`INSTALLATION REPOSITORIES (${repos.total_count}): ${JSON.stringify(repos.repositories.map(r => r.full_name))}`);
+            } else if (e.OP === "create") {
+              const { token } = await appToken();
+              const body = { name: NAME, head_sha: e.SHA, status: e.STATUS, external_id: e.EXTERNAL_ID || undefined };
+              if (e.STATUS === "completed") { body.conclusion = e.CONCLUSION; if (e.CONCLUSION === "action_required") body.details_url = "https://example.com/scratch"; }
+              if (e.CONCLUSION === "action_required") body.actions = [{ label: "Scratch", description: "scratch", identifier: "scratch" }];
+              const c = await gh(`/repos/${repo}/check-runs`, token, { method: "POST", body: JSON.stringify(body) });
+              log(`CREATED: ${show(c)}`);
+            } else if (e.OP === "update") {
+              const { token } = await appToken();
+              const body = { status: e.STATUS };
+              if (e.STATUS === "completed") body.conclusion = e.CONCLUSION;
+              if (e.EXTERNAL_ID) body.external_id = e.EXTERNAL_ID;
+              try { const c = await gh(`/repos/${repo}/check-runs/${e.CHECK_ID}`, token, { method: "PATCH", body: JSON.stringify(body) }); log(`UPDATED: ${show(c)}`); }
+              catch (err) { log(`UPDATE REFUSED: ${err.message}`); }
+            } else if (e.OP === "mintbad") {
+              try { await appToken({ contents: "read" }); log("MINT WITH A PERMISSION THE APP LACKS: unexpectedly succeeded"); }
+              catch (err) { log(`TOKEN MINT FAILURE (expected): ${err.message}`); }
+            } else if (e.OP === "badsha") {
+              const { token } = await appToken();
+              try { await gh(`/repos/${repo}/check-runs`, token, { method: "POST", body: JSON.stringify({ name: NAME, head_sha: "0".repeat(40), status: "completed", conclusion: "success" }) }); log("CHECK ON A MISSING SHA: unexpectedly created"); }
+              catch (err) { log(`CHECKS API FAILURE (expected): ${err.message}`); }
+            } else if (e.OP === "uninstall") {
+              const j = jwt();
+              const inst = await gh(`/repos/${repo}/installation`, j);
+              await gh(`/app/installations/${inst.id}`, j, { method: "DELETE" });
+              log(`UNINSTALLED installation ${inst.id}`);
+            } else throw new Error("unknown op");
+            process.exitCode = 0;
+          })().catch(err => { log(`PROBE ERROR: ${err.message}`); process.exitCode = 1; });

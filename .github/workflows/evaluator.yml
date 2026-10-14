@@ -1,8 +1,10 @@
 name: Gate-file guard evaluator
-# Scratch proof. Trusted (pull_request_target: GitHub runs main's copy). It mints a short-lived
-# installation token for the scratch GitHub App from a key stored ONLY in the main-only
-# environment "gate-identity", and publishes the App check "Gate-file guard" on the PR head.
-# Verdict rule (scratch only): success if the PR body's first line is "scratch-verdict: success".
+# SCRATCH PROOF ONLY. Trusted: for pull_request_target GitHub runs main's copy. Mints a short-lived
+# installation token for the scratch App from the key stored ONLY in the main-only environment
+# "gate-identity", and maintains ONE App check "Gate-file guard" per PR head: revoke to in_progress,
+# evaluate, re-read, publish success/failure; an older run that lost its claim does not publish.
+# Scratch directives (PR body lines): "scratch-evaluate: yes", "scratch-verdict: success",
+# "scratch-delay: N" (seconds), "scratch-crash: after-in-progress".
 on:
   pull_request_target:
     branches: [main]
@@ -19,41 +21,81 @@ jobs:
       name: gate-identity
       deployment: false
     steps:
-      - name: Publish the App check
+      - name: Evaluate and publish the App check
         env:
           APP_ID: ${{ vars.APP_ID }}
           APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
           GITHUB_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         shell: node {0}
         run: |
           "use strict";
           process.exitCode = 1;
+          const fs = require("fs");
           const crypto = require("crypto");
-          const api = "https://api.github.com";
+          const API = "https://api.github.com";
           const repo = process.env.GITHUB_REPOSITORY;
-          console.log(`event=${process.env.GITHUB_EVENT_NAME} ref=${process.env.GITHUB_REF} workflow_sha=${process.env.GITHUB_WORKFLOW_SHA}`);
-          console.log(`APP_ID present=${!!process.env.APP_ID} key length=${(process.env.APP_PRIVATE_KEY || "").length}`);
+          const NAME = "Gate-file guard";
+          const APP_ID = process.env.APP_ID;
+          const log = (...a) => console.log(...a);
           const b64 = o => Buffer.from(typeof o === "string" ? o : JSON.stringify(o)).toString("base64url");
+          // Never logs the key, a JWT or a token: errors carry only method, path, status and GitHub's message.
           async function gh(path, token, init = {}) {
-            const res = await fetch(api + path, { ...init, headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", ...(init.headers || {}) } });
+            const res = await fetch(API + path, { ...init, headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "Content-Type": "application/json" } });
             const text = await res.text();
-            if (!res.ok) throw new Error(`${init.method || "GET"} ${path}: HTTP ${res.status} ${text.slice(0, 200)}`);
+            if (!res.ok) { const e = new Error(`${init.method || "GET"} ${path.split("?")[0]}: HTTP ${res.status} ${text.slice(0, 160)}`); e.status = res.status; throw e; }
             return text ? JSON.parse(text) : {};
           }
-          (async () => {
+          function jwt() {
             const now = Math.floor(Date.now() / 1000);
-            const unsigned = `${b64({ alg: "RS256", typ: "JWT" })}.${b64({ iat: now - 60, exp: now + 540, iss: process.env.APP_ID })}`;
-            const jwt = `${unsigned}.${crypto.createSign("RSA-SHA256").update(unsigned).sign(process.env.APP_PRIVATE_KEY, "base64url")}`;
-            const inst = await gh(`/repos/${repo}/installation`, jwt);
-            const tok = await gh(`/app/installations/${inst.id}/access_tokens`, jwt, { method: "POST", body: JSON.stringify({ repositories: [repo.split("/")[1]], permissions: { checks: "write" } }) });
-            console.log(`installation ${inst.id}; token permissions ${JSON.stringify(tok.permissions)}`);
-            const pr = await gh(`/repos/${repo}/pulls/${process.env.PR_NUMBER}`, process.env.GITHUB_TOKEN);
-            const ok = (pr.body || "").split(/\r\n|\r|\n/)[0] === "scratch-verdict: success" && pr.head.sha === process.env.HEAD_SHA;
-            const check = await gh(`/repos/${repo}/check-runs`, tok.token, { method: "POST", body: JSON.stringify({
-              name: "Gate-file guard", head_sha: process.env.HEAD_SHA, status: "completed", conclusion: ok ? "success" : "failure",
-              external_id: `run-${process.env.GITHUB_RUN_ID}`, output: { title: ok ? "PASS" : "FAIL", summary: "scratch evaluator" } }) });
-            console.log(`check run ${check.id} app=${check.app && check.app.id} conclusion=${check.conclusion} head=${check.head_sha}`);
+            const unsigned = `${b64({ alg: "RS256", typ: "JWT" })}.${b64({ iat: now - 60, exp: now + 540, iss: APP_ID })}`;
+            return `${unsigned}.${crypto.createSign("RSA-SHA256").update(unsigned).sign(process.env.APP_PRIVATE_KEY, "base64url")}`;
+          }
+          async function appToken(permissions = { checks: "write" }) {
+            const j = jwt();
+            const inst = await gh(`/repos/${repo}/installation`, j);
+            const t = await gh(`/app/installations/${inst.id}/access_tokens`, j, { method: "POST", body: JSON.stringify({ repositories: [repo.split("/")[1]], permissions }) });
+            return { token: t.token, installation: inst.id, perms: t.permissions };
+          }
+          const sleep = ms => new Promise(r => setTimeout(r, ms));
+          const show = c => `check ${c.id} name=${JSON.stringify(c.name)} app=${c.app && c.app.id}/${c.app && c.app.slug} suite=${c.check_suite && c.check_suite.id} head=${c.head_sha} status=${c.status} conclusion=${c.conclusion} external_id=${c.external_id}`;
+          (async () => {
+            const ev = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, "utf8"));
+            const pr = ev.pull_request;
+            const head = pr.head.sha;
+            const marker = `${ev.action}:${pr.updated_at}:${process.env.GITHUB_RUN_ID}.${process.env.GITHUB_RUN_ATTEMPT}`;
+            log(`event=${process.env.GITHUB_EVENT_NAME} action=${ev.action} ref=${process.env.GITHUB_REF} workflow_sha=${process.env.GITHUB_WORKFLOW_SHA} head=${head} marker=${marker}`);
+            log(`key present: ${process.env.APP_PRIVATE_KEY ? "YES" : "NO"}; APP_ID=${APP_ID || "(missing)"}`);
+            const live = await gh(`/repos/${repo}/pulls/${pr.number}`, process.env.GITHUB_TOKEN);
+            const lines = (live.body || "").split(/\r\n|\r|\n/);
+            if (!lines.includes("scratch-evaluate: yes")) { log("not evaluating (no 'scratch-evaluate: yes')"); process.exitCode = 0; return; }
+            const delayLine = lines.find(l => l.startsWith("scratch-delay: "));
+            const delay = Math.min(90, Number(delayLine ? delayLine.slice(15) : 0) || 0);
+            const { token, installation, perms } = await appToken();
+            log(`TRUSTED TOKEN MINT: PASS (installation ${installation}, permissions ${JSON.stringify(perms)})`);
+            const list = await gh(`/repos/${repo}/commits/${head}/check-runs?check_name=${encodeURIComponent(NAME)}&filter=all&per_page=100`, token);
+            const mine = list.check_runs.filter(c => c.app && String(c.app.id) === String(APP_ID)).sort((a, b) => b.id - a.id);
+            let check;
+            if (mine.length) {
+              try {
+                check = await gh(`/repos/${repo}/check-runs/${mine[0].id}`, token, { method: "PATCH", body: JSON.stringify({ status: "in_progress", external_id: marker, output: { title: "Evaluating", summary: marker } }) });
+                log(`revoke: PATCH existing -> ${show(check)}`);
+              } catch (e) {
+                log(`revoke: PATCH to in_progress refused: ${e.message}`);
+                check = await gh(`/repos/${repo}/check-runs`, token, { method: "POST", body: JSON.stringify({ name: NAME, head_sha: head, status: "in_progress", external_id: marker }) });
+                log(`revoke fallback: new ${show(check)}`);
+              }
+            } else {
+              check = await gh(`/repos/${repo}/check-runs`, token, { method: "POST", body: JSON.stringify({ name: NAME, head_sha: head, status: "in_progress", external_id: marker }) });
+              log(`create: ${show(check)}`);
+            }
+            if (lines.includes("scratch-crash: after-in-progress")) { log("SCRATCH CRASH after in_progress"); process.exit(1); }
+            if (delay) { log(`sleeping ${delay}s`); await sleep(delay * 1000); }
+            const again = await gh(`/repos/${repo}/pulls/${pr.number}`, process.env.GITHUB_TOKEN);
+            const stale = again.head.sha !== head || (again.body || "") !== (pr.body || "");
+            const pass = !stale && (again.body || "").split(/\r\n|\r|\n/).includes("scratch-verdict: success");
+            const current = await gh(`/repos/${repo}/check-runs/${check.id}`, token);
+            if (current.external_id !== marker) { log(`SUPERSEDED: check ${check.id} claimed by ${current.external_id}; not publishing`); process.exitCode = 0; return; }
+            const done = await gh(`/repos/${repo}/check-runs/${check.id}`, token, { method: "PATCH", body: JSON.stringify({ status: "completed", conclusion: pass ? "success" : "failure", external_id: marker, output: { title: pass ? "PASS" : "FAIL", summary: stale ? "stale event" : marker } }) });
+            log(`PUBLISHED: ${show(done)} stale=${stale}`);
             process.exitCode = 0;
-          })().catch(e => { console.log(`FAIL: ${e.message}`); process.exitCode = 1; });
+          })().catch(e => { log(`EVALUATOR ERROR: ${e.message}`); process.exitCode = 1; });
