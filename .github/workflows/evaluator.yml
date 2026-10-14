@@ -1,8 +1,8 @@
 name: Gate-file guard evaluator
 # SCRATCH PROOF ONLY. Trusted: for pull_request_target GitHub runs main's copy. Mints a short-lived
 # installation token for the scratch App from the key stored ONLY in the main-only environment
-# "gate-identity", and maintains ONE App check "Gate-file guard" per PR head: revoke to in_progress,
-# evaluate, re-read, publish success/failure; an older run that lost its claim does not publish.
+# "gate-identity". Each evaluation creates a NEW App check "Gate-file guard" (in_progress) on the PR
+# head, evaluates, re-reads the PR, and completes that check with success or failure only.
 # Scratch directives (PR body lines): "scratch-evaluate: yes", "scratch-verdict: success",
 # "scratch-delay: N" (seconds), "scratch-crash: after-in-progress".
 on:
@@ -72,29 +72,17 @@ jobs:
             const delay = Math.min(90, Number(delayLine ? delayLine.slice(15) : 0) || 0);
             const { token, installation, perms } = await appToken();
             log(`TRUSTED TOKEN MINT: PASS (installation ${installation}, permissions ${JSON.stringify(perms)})`);
-            const list = await gh(`/repos/${repo}/commits/${head}/check-runs?check_name=${encodeURIComponent(NAME)}&filter=all&per_page=100`, token);
-            const mine = list.check_runs.filter(c => c.app && String(c.app.id) === String(APP_ID)).sort((a, b) => b.id - a.id);
-            let check;
-            if (mine.length) {
-              try {
-                check = await gh(`/repos/${repo}/check-runs/${mine[0].id}`, token, { method: "PATCH", body: JSON.stringify({ status: "in_progress", external_id: marker, output: { title: "Evaluating", summary: marker } }) });
-                log(`revoke: PATCH existing -> ${show(check)}`);
-              } catch (e) {
-                log(`revoke: PATCH to in_progress refused: ${e.message}`);
-                check = await gh(`/repos/${repo}/check-runs`, token, { method: "POST", body: JSON.stringify({ name: NAME, head_sha: head, status: "in_progress", external_id: marker }) });
-                log(`revoke fallback: new ${show(check)}`);
-              }
-            } else {
-              check = await gh(`/repos/${repo}/check-runs`, token, { method: "POST", body: JSON.stringify({ name: NAME, head_sha: head, status: "in_progress", external_id: marker }) });
-              log(`create: ${show(check)}`);
-            }
+            // Model proven in the scratch experiments: GitHub uses the most recently CREATED App check run
+            // (re-updating an older run does not change that), and a completed run cannot go back to
+            // in_progress. So every evaluation creates a NEW in_progress check, which immediately becomes
+            // authoritative and revokes any earlier success; the final verdict is written to that check only.
+            const check = await gh(`/repos/${repo}/check-runs`, token, { method: "POST", body: JSON.stringify({ name: NAME, head_sha: head, status: "in_progress", external_id: marker, output: { title: "Evaluating", summary: marker } }) });
+            log(`create: ${show(check)}`);
             if (lines.includes("scratch-crash: after-in-progress")) { log("SCRATCH CRASH after in_progress"); process.exit(1); }
             if (delay) { log(`sleeping ${delay}s`); await sleep(delay * 1000); }
             const again = await gh(`/repos/${repo}/pulls/${pr.number}`, process.env.GITHUB_TOKEN);
             const stale = again.head.sha !== head || (again.body || "") !== (pr.body || "");
             const pass = !stale && (again.body || "").split(/\r\n|\r|\n/).includes("scratch-verdict: success");
-            const current = await gh(`/repos/${repo}/check-runs/${check.id}`, token);
-            if (current.external_id !== marker) { log(`SUPERSEDED: check ${check.id} claimed by ${current.external_id}; not publishing`); process.exitCode = 0; return; }
             const done = await gh(`/repos/${repo}/check-runs/${check.id}`, token, { method: "PATCH", body: JSON.stringify({ status: "completed", conclusion: pass ? "success" : "failure", external_id: marker, output: { title: pass ? "PASS" : "FAIL", summary: stale ? "stale event" : marker } }) });
             log(`PUBLISHED: ${show(done)} stale=${stale}`);
             process.exitCode = 0;
